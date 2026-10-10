@@ -5117,7 +5117,20 @@ static void nds_tick_ipc_fifo(nds_t* nds){
     }
   }
 }
-
+static void nds_reset_audio_channel(nds_t* nds, int channel, bool is_adpcm){
+  nds_audio_t * audio = &(nds->audio);
+  audio->channel[channel].sample=0;
+  audio->channel[channel].lfsr = 0x7FFF;
+  uint32_t tmr = nds7_io_read16(nds,NDS7_SOUND0_TMR+channel*16)*2;
+  if(is_adpcm){  
+    uint32_t sad = nds7_io_read32(nds,NDS7_SOUND0_SAD+channel*16);
+    uint32_t header = nds7_read32(nds,sad);
+    audio->channel[channel].adpcm_sample = (int16_t)(header & 0xFFFF);
+    audio->channel[channel].adpcm_index = (header >> 16) & 0x7F;
+    if(audio->channel[channel].adpcm_index>88)audio->channel[channel].adpcm_index=88;
+  }
+  audio->channel[channel].timer = tmr;
+}
 static bool nds_preprocess_mmio(nds_t * nds, uint32_t addr,uint32_t data, int transaction_type){
   uint32_t word_mask = nds_word_mask(addr,transaction_type);
   uint32_t baddr =addr;
@@ -5139,6 +5152,19 @@ static bool nds_preprocess_mmio(nds_t * nds, uint32_t addr,uint32_t data, int tr
       float val = clipmtx[i];
       int32_t fixed_val = val;
       nds9_io_store32(nds,NDS9_CLIPMTX_RESULT+i*4,fixed_val);
+    }
+  }else if(cpu == NDS_ARM7 && (transaction_type & NDS_MEM_WRITE) && (addr >= NDS7_SOUND0_CNT && addr <= NDS7_SOUNDF_CNT)){
+    int channel = (addr - NDS7_SOUND0_CNT)/16; 
+    bool is_soundx_cnt = ((addr - NDS7_SOUND0_CNT)%16) ==0; 
+    if(is_soundx_cnt){
+      uint32_t aligned_data = nds_align_data(baddr,data,transaction_type);
+      uint32_t old_data = nds7_io_read32(nds,addr);
+      uint32_t new_data = (old_data &~word_mask)| (aligned_data&(word_mask)); 
+      bool newly_enabled = SB_BFE(new_data, 31,1)&&!SB_BFE(old_data,31,1);
+      if(newly_enabled){
+        int format =  SB_BFE(new_data,29,2);//(0=PCM8, 1=PCM16, 2=IMA-ADPCM, 3=PSG/Noise);
+        nds_reset_audio_channel(nds,channel, format==2);
+      }
     }
   }
   switch(addr){
@@ -6707,6 +6733,8 @@ static FORCE_INLINE float nds_polyblep(float t,float dt){
   }else return 0; 
 }
 static FORCE_INLINE float nds_bandlimited_square(float t, float duty_cycle,float dt){
+  //When the square wave becomes too high in frequency just output the average value. 
+  if(dt>0.5)return 1.0-2.0*duty_cycle; 
   float t2 = t - duty_cycle;
   if(t2< 0.0)t2 +=1.0;
   float y = t < duty_cycle ? -1 : 1;
@@ -6778,7 +6806,7 @@ static FORCE_INLINE void nds_tick_audio(nds_t*nds, sb_emu_state_t*emu){
   while(audio->current_sample_generated_time < current_sim_time){
     uint64_t prev_cycles = audio->current_sample_generated_time;
     audio->current_sample_generated_time+=33513982*64/SE_AUDIO_SAMPLE_RATE;
-    uint64_t cycles_since_tick=(audio->current_sample_generated_time-prev_cycles)/64; 
+    uint64_t cycles_since_tick=(audio->current_sample_generated_time/64)-(prev_cycles/64); 
 
     const float lowpass_coef = 0.999;
 
@@ -6789,20 +6817,17 @@ static FORCE_INLINE void nds_tick_audio(nds_t*nds, sb_emu_state_t*emu){
       uint32_t tmr = nds7_io_read16(nds,NDS7_SOUND0_TMR+c*16)*2;
       int format =  SB_BFE(cnt,29,2);//(0=PCM8, 1=PCM16, 2=IMA-ADPCM, 3=PSG/Noise);
       if(!enable){
-        audio->channel[c].sample=0;
-        audio->channel[c].lfsr = 0x7FFF;
-        audio->channel[c].timer = tmr;
         emu->audio_channel_output[c] = emu->audio_channel_output[c]*lowpass_coef;
         continue;
       }
       uint32_t sad = nds7_io_read32(nds,NDS7_SOUND0_SAD+c*16);
-      uint16_t pnt = nds7_io_read16(nds,NDS7_SOUND0_PNT+c*16);
-      uint16_t len = nds7_io_read32(nds,NDS7_SOUND0_LEN+c*16);
+      uint32_t pnt = nds7_io_read16(nds,NDS7_SOUND0_PNT+c*16);
+      uint32_t len = SB_BFE(nds7_io_read32(nds,NDS7_SOUND0_LEN+c*16),0,22);
       uint32_t tot_samps = len*4;
       switch(format){
         case 0: tot_samps = (len+pnt)*4; pnt*=4;break;
         case 1: tot_samps = (len+pnt)*2; pnt*=2;break;
-        case 2: tot_samps = 8*(len+pnt-1); pnt=(pnt-1)*8;break;
+        case 2: tot_samps = 8*(len+pnt); pnt=pnt*8;break;
         case 3: tot_samps = 8;  break;
       }
       if(enable){
@@ -6812,13 +6837,17 @@ static FORCE_INLINE void nds_tick_audio(nds_t*nds, sb_emu_state_t*emu){
           case 1: v= ((int16_t)nds7_read16(nds,sad+audio->channel[c].sample*2))/32768.;break;
           case 2: v= ((int16_t)audio->channel[c].adpcm_sample) / 32768.0;break;
           case 3:
-          if(c>=8&&c<=13)v= (audio->channel[c].sample<SB_BFE(cnt,24,3))*2.-1.;//Todo: add antialiasing
+          if(c>=8&&c<=13){
+            float frac = ((float)audio->channel[c].timer - (float)tmr) / (0x20000 - (float)tmr); 
+            frac = frac> 1.0 ? 1.0 : (frac<0.0? 0.0: frac); 
+            float t = (audio->channel[c].sample + frac) / 8; 
+            int N = SB_BFE(cnt,24,3); 
+            float duty_cycle = (7.0-N)/8.0; 
+            float dt = (float)cycles_since_tick / ((0x20000 - (float)tmr)*8.0);
+            v = nds_bandlimited_square(t, duty_cycle,dt);
+          }
           else if(c==14||c==15){ //PSG Noise
-            if(audio->channel[c].lfsr&1){
-              v = -1.;
-              audio->channel[c].lfsr^=0x6000<<1;
-            }else v= 1;
-            audio->channel[c].lfsr>>=1;
+           v = (audio->channel[c].lfsr&1) ? -1. : 1; 
           }
           break; 
         }
@@ -6833,9 +6862,10 @@ static FORCE_INLINE void nds_tick_audio(nds_t*nds, sb_emu_state_t*emu){
       }
       audio->channel[c].timer+=cycles_since_tick;
       while(audio->channel[c].timer>0x1ffff){
+        audio->channel[c].sample+=1;
         audio->channel[c].timer-=0x20000;
         audio->channel[c].timer+=tmr;
-        if(audio->channel[c].sample+1>=tot_samps){
+        if(audio->channel[c].sample>=tot_samps){
           int repeat_mode = SB_BFE(cnt,27,2);
           switch(repeat_mode){
             case 0: audio->channel[c].sample=0; enable=false;break; //Manual (TODO: Does this repeat?)
@@ -6853,7 +6883,13 @@ static FORCE_INLINE void nds_tick_audio(nds_t*nds, sb_emu_state_t*emu){
           if(!enable){
             cnt&=~(1u<<31);
             nds7_io_store32(nds,NDS7_SOUND0_CNT+c*16,cnt);
+            break;
           }
+        }
+        //Increment LFSR value when the timer overflows
+        if((format == 3)&&(c==14||c==15)){ 
+          if(audio->channel[c].lfsr&1)audio->channel[c].lfsr^=0x6000<<1;
+          audio->channel[c].lfsr>>=1;
         }
         if(format==2){
             if(audio->channel[c].sample==pnt){
@@ -6880,38 +6916,38 @@ static FORCE_INLINE void nds_tick_audio(nds_t*nds, sb_emu_state_t*emu){
               audio->channel[c].adpcm_sample = (int16_t)(header & 0xFFFF);
               audio->channel[c].adpcm_index = (header >> 16) & 0x7F;
               if(audio->channel[c].adpcm_index>88)audio->channel[c].adpcm_index=88;
+            }else if(audio->channel[c].sample>=8){
+              uint8_t data = nds7_read8(nds,sad+audio->channel[c].sample/2);
+              data = (data>>((audio->channel[c].sample&1)*4))&0xf;
+
+              int16_t entry = adpcm_table[audio->channel[c].adpcm_index];
+              int16_t diff = entry >> 3;
+              if (data & 1) diff += entry >> 2;
+              if (data & 2) diff += entry >> 1;
+              if (data & 4) diff += entry;
+
+              if (data & 8) audio->channel[c].adpcm_sample = audio->channel[c].adpcm_sample - diff;
+              else audio->channel[c].adpcm_sample = audio->channel[c].adpcm_sample + diff;
+              if(audio->channel[c].adpcm_sample>+0x7FFF)audio->channel[c].adpcm_sample=0x7fff;
+              if(audio->channel[c].adpcm_sample<-0x7FFF)audio->channel[c].adpcm_sample=-0x7fff;
+              int new_index = audio->channel[c].adpcm_index + adpcm_indextable[data & 7];
+              if(new_index>88)new_index=88;
+              if(new_index<0)new_index=0;
+              audio->channel[c].adpcm_index =new_index;
             }
-            uint8_t data = nds7_read8(nds,sad+audio->channel[c].sample/2+4);
-            data = (data>>((audio->channel[c].sample&1)*4))&0xf;
-
-            int16_t entry = adpcm_table[audio->channel[c].adpcm_index];
-            int16_t diff = entry >> 3;
-            if (data & 1) diff += entry >> 2;
-            if (data & 2) diff += entry >> 1;
-            if (data & 4) diff += entry;
-
-            if (data & 8) audio->channel[c].adpcm_sample = audio->channel[c].adpcm_sample - diff;
-            else audio->channel[c].adpcm_sample = audio->channel[c].adpcm_sample + diff;
-            if(audio->channel[c].adpcm_sample>+0x7FFF)audio->channel[c].adpcm_sample=0x7fff;
-            if(audio->channel[c].adpcm_sample<-0x7FFF)audio->channel[c].adpcm_sample=-0x7fff;
-            int new_index = audio->channel[c].adpcm_index + adpcm_indextable[data & 7];
-            if(new_index>88)new_index=88;
-            if(new_index<0)new_index=0;
-            audio->channel[c].adpcm_index =new_index;
         }
-        audio->channel[c].sample+=1;
       }
     }
     if((sb_ring_buffer_size(&emu->audio_ring_buff)+3>SB_AUDIO_RING_BUFFER_SIZE)) continue;
 
+    l*=0.5;
+    r*=0.5;
+    
     // Clipping
     if(l>1.0)l=1;
     if(r>1.0)r=1;
     if(l<-1.0)l=-1;
     if(r<-1.0)r=-1;
-    l*=0.5;
-    r*=0.5;
-
     // Quantization
     unsigned write_entry0 = (emu->audio_ring_buff.write_ptr++)%SB_AUDIO_RING_BUFFER_SIZE;
     unsigned write_entry1 = (emu->audio_ring_buff.write_ptr++)%SB_AUDIO_RING_BUFFER_SIZE;
