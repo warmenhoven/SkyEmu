@@ -6210,17 +6210,21 @@ static FORCE_INLINE void nds_tick_ppu(nds_t* nds,bool render){
             break; 
         }
       }
-
+      int disp_r = r; 
+      int disp_g = g; 
+      int disp_b = b; 
+      //In HW the vram read in display_mode 2 occurs before the capture, but only routes
+      //directly to the display and is not used for the capture computation. 
       if(display_mode==2&&ppu_id==0){
         int vram_block = SB_BFE(dispcnt,18,2);
         uint16_t value = ((uint16_t*)nds->mem.vram)[lcd_x+lcd_y*NDS_LCD_W+vram_block*64*1024];
-        r = SB_BFE(value,0,5);
-        g = SB_BFE(value,5,5);
-        b = SB_BFE(value,10,5);
+        disp_r = SB_BFE(value,0,5);
+        disp_g = SB_BFE(value,5,5);
+        disp_b = SB_BFE(value,10,5);
       }else if(display_mode==0){
-        r=31;
-        g=31;
-        b=31;
+        disp_r=31;
+        disp_g=31;
+        disp_b=31;
       }
 
       if(enable_capture){
@@ -6242,15 +6246,14 @@ static FORCE_INLINE void nds_tick_ppu(nds_t* nds,bool render){
           int capture_mode = SB_BFE(dispcapcnt,29,2);
           
           if(capture_mode>=2){        
-            int r = SB_BFE(color,0,5);
-            int g = SB_BFE(color,5,5);
-            int b = SB_BFE(color,10,5);
+            int blend_r = SB_BFE(color,0,5);
+            int blend_g = SB_BFE(color,5,5);
+            int blend_b = SB_BFE(color,10,5);
             int read_offset = SB_BFE(dispcapcnt, 26,2);
             uint32_t read_address = 0x06800000;
             read_address+=read_offset*0x08000;
             read_address+=lcd_y*szx*2+lcd_x*2;
             uint16_t color2=nds_ppu_read16(nds,read_address);
-            if(display_mode==2)color2=ppu->first_target_buffer[lcd_x];
 
             int r2 = SB_BFE(color2,0,5);
             int g2 = SB_BFE(color2,5,5);
@@ -6260,16 +6263,16 @@ static FORCE_INLINE void nds_tick_ppu(nds_t* nds,bool render){
         
             if(eva>16)eva=16;
             if(evb>16)evb=16;
-            r = (r*eva+r2*evb)/16;
-            g = (g*eva+g2*evb)/16;
-            b = (b*eva+b2*evb)/16;
-            if(r>31)r = 31;
-            if(g>31)g = 31;
-            if(b>31)b = 31;
-            color  = SB_BFE(r,0,5);
-            color |= SB_BFE(g,0,5)<<5;
-            color |= SB_BFE(b,0,5)<<10;
-          }      
+            blend_r = (blend_r*eva+r2*evb)/16;
+            blend_g = (blend_g*eva+g2*evb)/16;
+            blend_b = (blend_b*eva+b2*evb)/16;
+            if(blend_r>31)blend_r = 31;
+            if(blend_g>31)blend_g = 31;
+            if(blend_b>31)blend_b = 31;
+            color  = SB_BFE(blend_r,0,5);
+            color |= SB_BFE(blend_g,0,5)<<5;
+            color |= SB_BFE(blend_b,0,5)<<10;
+          }
           uint32_t write_address = 0x06800000;
           write_address+=write_block*128*1024;
           write_address+=write_offset*0x08000;
@@ -6278,10 +6281,6 @@ static FORCE_INLINE void nds_tick_ppu(nds_t* nds,bool render){
           nds9_write16(nds,write_address,color);
         }
       }
-
-      int disp_r = r; 
-      int disp_g = g; 
-      int disp_b = b; 
       {
         uint16_t master_brightness= nds9_io_read16(nds,reg_offset+NDS_A_MASTER_BRIGHT);
         int mode = SB_BFE(master_brightness,14,2);
@@ -6299,9 +6298,9 @@ static FORCE_INLINE void nds_tick_ppu(nds_t* nds,bool render){
             disp_r -= disp_r*factor/16;
             disp_g -= disp_g*factor/16;
             disp_b -= disp_b*factor/16;
-            if(disp_r<0)r=0;
-            if(disp_g<0)g=0;
-            if(disp_b<0)b=0;
+            if(disp_r<0)disp_r=0;
+            if(disp_g<0)disp_g=0;
+            if(disp_b<0)disp_b=0;
           }
         }
       }
